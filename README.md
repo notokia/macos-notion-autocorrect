@@ -50,6 +50,12 @@ To generate a universal `.dmg` in `dist/NotionAutocorrect.dmg`:
 
 ---
 
+## Feedback & Bug Reports
+
+Found a bug or have a feature request? [Open an Issue](https://github.com/notokia/macos-notion-autocorrect/issues/new/choose) and let me know!
+
+---
+
 ## Support This Project
 
 If **NotionAutocorrect** saves you time every day, consider giving this repo a ⭐ **Star** or buying me a coffee!

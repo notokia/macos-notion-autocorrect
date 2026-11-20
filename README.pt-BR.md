@@ -50,6 +50,12 @@ Para gerar o instalador `.dmg` em `dist/NotionAutocorrect.dmg`:
 
 ---
 
+## Feedback e Relato de Bugs
+
+Encontrou algum bug ou tem uma sugestão de melhoria? [Abra uma Issue](https://github.com/notokia/macos-notion-autocorrect/issues/new/choose) por aqui!
+
+---
+
 ## Apoie o Projeto
 
 Se o **NotionAutocorrect** economiza o seu tempo no dia a dia, deixe uma ⭐ **Star** no repositório ou pague um café para apoiar o projeto!
