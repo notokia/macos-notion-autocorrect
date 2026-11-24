@@ -1,6 +1,8 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import <Carbon/Carbon.h>
 #import <stdatomic.h>
+#import <unistd.h>
 
 static const int64_t kSyntheticEventMagic = 0x4E4F544E; // 'NOTN'
 static const CGKeyCode kKeyCodeBackspace = 51;
@@ -29,6 +31,7 @@ static const CGKeyCode kKeyCodeEscape    = 53;
 @property (nonatomic, assign) BOOL skipCurrentWord;
 @property (nonatomic, assign) BOOL wordHasTrailingDot;
 @property (nonatomic, assign) BOOL lastKnownTrusted;
+@property (nonatomic, assign) UInt32 deadKeyState;
 @property (nonatomic, strong) NSDictionary<NSString *, NSDictionary<NSString *, NSString *> *> *builtinByLang;
 @property (nonatomic, strong) NSDictionary<NSString *, NSDictionary<NSString *, NSString *> *> *abbrevByLang;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *systemReplacementsMap;
@@ -119,7 +122,10 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
                                                             name:@"com.bernardo.NotionAutocorrect.runSelfTest"
                                                           object:nil];
 
-    [self showControlWindow:nil];
+    BOOL launchedInBackground = [[[NSProcessInfo processInfo] arguments] containsObject:@"--background"];
+    if (!launchedInBackground || !AXIsProcessTrusted()) {
+        [self showControlWindow:nil];
+    }
 
     self.permissionTimer = [NSTimer scheduledTimerWithTimeInterval:1.5
                                                             target:self
@@ -130,6 +136,17 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
     return NO; // Continua rodando em segundo plano quando fecha a janela
+}
+
+- (void)windowWillClose:(NSNotification *)notification {
+    if (notification.object == self.mainWindow) {
+        // Esconde do Cmd+Tab / Dock quando a janela fecha para evitar Cmd+Q acidental!
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!self.mainWindow.isVisible && (!self.ignoredWordsWindow || !self.ignoredWordsWindow.isVisible)) {
+                [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+            }
+        });
+    }
 }
 
 - (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag {
@@ -563,7 +580,16 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         @"classico": @"clássico", @"classica": @"clássica", @"beneficio": @"benefício",
         @"beneficios": @"benefícios", @"prejuizo": @"prejuízo", @"prejuizos": @"prejuízos",
         @"diagnostico": @"diagnóstico", @"proposito": @"propósito", @"veiculo": @"veículo",
-        @"veiculos": @"veículos", @"obstaculo": @"obstáculo", @"obstaculos": @"obstáculos"
+        @"veiculos": @"veículos", @"obstaculo": @"obstáculo", @"obstaculos": @"obstáculos",
+        @"empresario": @"empresário", @"secretario": @"secretário", @"inventario": @"inventário",
+        @"aniversario": @"aniversário", @"vitoria": @"vitória", @"gloria": @"glória",
+        @"ferias": @"férias", @"media": @"média", @"medias": @"médias", @"medio": @"médio",
+        @"remedio": @"remédio", @"estagio": @"estágio", @"privilegio": @"privilégio",
+        @"oficio": @"ofício", @"indicio": @"indício", @"raizes": @"raízes",
+        @"republica": @"república", @"uteis": @"úteis", @"moveis": @"móveis",
+        @"vinculo": @"vínculo", @"estimulo": @"estímulo", @"vertice": @"vértice",
+        @"deficit": @"déficit", @"superavit": @"superávit", @"serio": @"sério",
+        @"acao": @"ação", @"acoes": @"ações"
     };
 
     NSDictionary *enBuiltin = @{
@@ -937,6 +963,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 }
 
 - (void)showControlWindow:(id)sender {
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [NSApp activateIgnoringOtherApps:YES];
     [self.mainWindow makeKeyAndOrderFront:nil];
     [self updateStatusUI];
@@ -1222,9 +1249,9 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         NSString *execPath = [[NSBundle mainBundle] executablePath] ?: @"/Applications/NotionAutocorrect.app/Contents/MacOS/NotionAutocorrect";
         NSDictionary *plist = @{
             @"Label": @"com.bernardo.NotionAutocorrect",
-            @"ProgramArguments": @[execPath],
+            @"ProgramArguments": @[execPath, @"--background"],
             @"RunAtLoad": @YES,
-            @"KeepAlive": @NO
+            @"KeepAlive": @{@"SuccessfulExit": @NO}
         };
         [plist writeToFile:path atomically:YES];
     }
@@ -1268,6 +1295,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     self.skipCurrentWord = NO;
     self.wordHasTrailingDot = NO;
     self.canUndoLastCorrection = NO;
+    self.deadKeyState = 0;
 }
 
 - (void)resetSentenceAndWordBuffer {
@@ -1340,6 +1368,45 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     return corr;
 }
 
+- (NSUInteger)portugueseVowelAccentCount:(NSString *)word {
+    NSCharacterSet *accents = [NSCharacterSet characterSetWithCharactersInString:@"áéíóúâêôãõàÁÉÍÓÚÂÊÔÃÕÀ"];
+    NSUInteger cnt = 0;
+    for (NSUInteger i = 0; i < word.length; i++) {
+        if ([accents characterIsMember:[word characterAtIndex:i]]) cnt++;
+    }
+    return cnt;
+}
+
+- (NSUInteger)damerauLevenshteinDistance:(NSString *)s1 and:(NSString *)s2 {
+    NSUInteger n = s1.length, m = s2.length;
+    if (n == 0) return m;
+    if (m == 0) return n;
+    if (n > 40 || m > 40) return 99;
+
+    NSUInteger d[42][42];
+    for (NSUInteger i = 0; i <= n; i++) d[i][0] = i;
+    for (NSUInteger j = 0; j <= m; j++) d[0][j] = j;
+
+    for (NSUInteger i = 1; i <= n; i++) {
+        unichar c1 = [s1 characterAtIndex:i - 1];
+        for (NSUInteger j = 1; j <= m; j++) {
+            unichar c2 = [s2 characterAtIndex:j - 1];
+            NSUInteger cost = (c1 == c2) ? 0 : 1;
+            NSUInteger del = d[i - 1][j] + 1;
+            NSUInteger ins = d[i][j - 1] + 1;
+            NSUInteger sub = d[i - 1][j - 1] + cost;
+            NSUInteger best = MIN(del, MIN(ins, sub));
+            if (i > 1 && j > 1 &&
+                c1 == [s2 characterAtIndex:j - 2] &&
+                [s1 characterAtIndex:i - 2] == c2) {
+                best = MIN(best, d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = best;
+        }
+    }
+    return d[n][m];
+}
+
 - (NSString *)correctionForWord:(NSString *)word {
     if (word.length < 2 || word.length > 35) return nil;
 
@@ -1372,13 +1439,13 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         }
     }
 
-    // 2. Abreviações do idioma selecionado
+    // 3. Abreviações do idioma selecionado
     NSDictionary *langAbbrev = self.abbrevByLang[lang];
     if (self.expandAbbreviations && langAbbrev[lower]) {
         return [self applyCaseOfOriginal:word toCorrection:langAbbrev[lower]];
     }
 
-    // 3. Mapa nativo de acentuação/contrações do idioma selecionado
+    // 4. Mapa nativo de acentuação/contrações do idioma selecionado
     NSDictionary *langBuiltin = self.builtinByLang[lang];
     if (langBuiltin[lower]) {
         return [self applyCaseOfOriginal:word toCorrection:langBuiltin[lower]];
@@ -1394,7 +1461,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         return nil;
     }
 
-    // 4. Motor oficial da Apple: NSSpellChecker no idioma selecionado
+    // 5. Motor oficial da Apple: NSSpellChecker no idioma selecionado
     NSSpellChecker *sc = [NSSpellChecker sharedSpellChecker];
     NSRange fullRange = NSMakeRange(0, word.length);
     NSRange misspelled = [sc checkSpellingOfString:word
@@ -1410,37 +1477,62 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
     NSString *foldedWord = [word stringByFoldingWithOptions:(NSDiacriticInsensitiveSearch | NSCaseInsensitiveSearch)
                                                      locale:loc];
+    BOOL isPortuguese = [lang hasPrefix:@"pt"];
+
+    NSArray<NSString *> *guesses = [sc guessesForWordRange:fullRange
+                                                  inString:word
+                                                  language:lang
+                                    inSpellDocumentWithTag:self.spellDocTag];
+
+    // 5a. Prioridade máxima: sugestão real do dicionário cuja base sem acento/cedilha é idêntica!
+    // (Exige que adicione acento/cedilha real e, em português, no máximo 1 vogal acentuada para bloquear "aprensêntacão")
+    for (NSString *g in guesses) {
+        if (isPortuguese && ([g containsString:@"ü"] || [self portugueseVowelAccentCount:g] > 1)) continue;
+        NSString *lowerG = [g lowercaseStringWithLocale:loc];
+        if ([lowerG isEqualToString:lower]) continue; // Ignora mudança apenas de maiúscula ("universidad" -> "Universidad")
+        NSString *foldedG = [g stringByFoldingWithOptions:(NSDiacriticInsensitiveSearch | NSCaseInsensitiveSearch)
+                                                   locale:loc];
+        if ([foldedG isEqualToString:foldedWord] && ![g isEqualToString:word]) {
+            return [self applyCaseOfOriginal:word toCorrection:lowerG];
+        }
+    }
 
     NSString *corr = [sc correctionForWordRange:fullRange
                                        inString:word
                                        language:lang
                          inSpellDocumentWithTag:self.spellDocTag];
 
-    BOOL isPortuguese = [lang hasPrefix:@"pt"];
-
-    if (corr && ![corr isEqualToString:word] && !(isPortuguese && [corr containsString:@"ü"])) {
-        NSString *foldedCorr = [corr stringByFoldingWithOptions:(NSDiacriticInsensitiveSearch | NSCaseInsensitiveSearch)
-                                                         locale:loc];
-        if ([foldedCorr isEqualToString:foldedWord]) {
+    // Valida se corr é uma palavra real (e não uma síntese inválida como "aprensêntacão")
+    if (corr && ![corr isEqualToString:word] && ![corr containsString:@" "] && ![corr containsString:@"-"] &&
+        !(isPortuguese && ([corr containsString:@"ü"] || [self portugueseVowelAccentCount:corr] > 1))) {
+        BOOL corrIsValid = [guesses containsObject:corr];
+        if (!corrIsValid) {
+            NSRange checkCorr = [sc checkSpellingOfString:corr
+                                               startingAt:0
+                                                 language:lang
+                                                     wrap:NO
+                                   inSpellDocumentWithTag:self.spellDocTag
+                                                wordCount:NULL];
+            corrIsValid = (checkCorr.location == NSNotFound);
+        }
+        if (corrIsValid) {
             return [self applyCaseOfOriginal:word toCorrection:corr];
         }
     }
 
-    NSArray<NSString *> *guesses = [sc guessesForWordRange:fullRange
-                                                  inString:word
-                                                  language:lang
-                                    inSpellDocumentWithTag:self.spellDocTag];
+    // 5b. Fallback inteligente usando guesses[0] quando correctionForWordRange retorna nil ou inválido
+    // (ex.: "universidad" -> "universidade", "aprensentacao" -> "apresentação")
     for (NSString *g in guesses) {
-        if (isPortuguese && [g containsString:@"ü"]) continue;
+        if ([g containsString:@" "] || [g containsString:@"-"] || (isPortuguese && [g containsString:@"ü"])) continue;
         NSString *foldedG = [g stringByFoldingWithOptions:(NSDiacriticInsensitiveSearch | NSCaseInsensitiveSearch)
                                                    locale:loc];
-        if ([foldedG isEqualToString:foldedWord] && ![g isEqualToString:word]) {
-            return [self applyCaseOfOriginal:word toCorrection:g];
+        NSUInteger dist = [self damerauLevenshteinDistance:foldedWord and:foldedG];
+        NSUInteger maxAllowed = (word.length >= 6) ? 2 : 1;
+        if (dist <= maxAllowed && ![g isEqualToString:word]) {
+            NSString *lowerG = [g lowercaseStringWithLocale:loc];
+            return [self applyCaseOfOriginal:word toCorrection:lowerG];
         }
-    }
-
-    if (corr && ![corr isEqualToString:word] && ![corr containsString:@" "] && ![corr containsString:@"-"]) {
-        return [self applyCaseOfOriginal:word toCorrection:corr];
+        break; // Avalia apenas a melhor sugestão válida do topo
     }
 
     return nil;
@@ -1547,9 +1639,15 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
     CGKeyCode keyCode = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
 
-    if (keyCode == kKeyCodeEscape || keyCode == kKeyCodeTab ||
-        keyCode == 123 || keyCode == 124 || keyCode == 125 || keyCode == 126) {
+    if (keyCode == kKeyCodeEscape || keyCode == kKeyCodeTab) {
         [self resetSentenceAndWordBuffer];
+        return event;
+    }
+
+    // Setas de navegação movem o cursor para o meio de palavras já escritas -> ignora até o próximo espaço/Enter
+    if (keyCode == 123 || keyCode == 124 || keyCode == 125 || keyCode == 126) {
+        [self resetSentenceAndWordBuffer];
+        self.skipCurrentWord = YES;
         return event;
     }
 
@@ -1592,6 +1690,7 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     }
 
     if (keyCode == kKeyCodeBackspace) {
+        self.deadKeyState = 0;
         if (self.canUndoLastCorrection && self.lastOriginalWord && self.lastCorrectedWord) {
             NSString *orig = self.lastOriginalWord;
             NSString *corr = self.lastCorrectedWord;
@@ -1629,7 +1728,8 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         if (self.wordBuffer.length > 0) {
             [self.wordBuffer deleteCharactersInRange:NSMakeRange(self.wordBuffer.length - 1, 1)];
         } else {
-            self.skipCurrentWord = NO;
+            // Backspace com wordBuffer vazio significa que o cursor voltou para dentro da palavra anterior -> evita corromper sufixo!
+            self.skipCurrentWord = YES;
         }
         if (atomic_load(&gActiveReplacementsCount) > 0) {
             [self sendBackspaces:1 thenString:nil];
@@ -1640,11 +1740,45 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
     UniChar chars[8];
     UniCharCount actualLen = 0;
-    CGEventKeyboardGetUnicodeString(event, 8, &actualLen, chars);
+
+    // Usa UCKeyTranslate para compor dead-keys (' + c = ç, ~ + a = ã, ´ + e = é) exatamente igual ao layout ativo (ex.: Brazilian - Pro)
+    BOOL isSelfTestEvent = (CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == getpid());
+    if (!isSelfTestEvent) {
+        TISInputSourceRef inputSource = TISCopyCurrentKeyboardLayoutInputSource();
+        if (inputSource) {
+            CFDataRef layoutData = TISGetInputSourceProperty(inputSource, kTISPropertyUnicodeKeyLayoutData);
+            if (layoutData) {
+                const UCKeyboardLayout *kbdLayout = (const UCKeyboardLayout *)CFDataGetBytePtr(layoutData);
+                UInt32 mod = 0;
+                if (flags & kCGEventFlagMaskShift)      mod |= (shiftKey >> 8);
+                if (flags & kCGEventFlagMaskAlphaShift) mod |= (alphaLock >> 8);
+                if (flags & kCGEventFlagMaskAlternate)  mod |= (optionKey >> 8);
+                UInt32 deadState = self.deadKeyState;
+                OSStatus status = UCKeyTranslate(kbdLayout,
+                                                 keyCode,
+                                                 kUCKeyActionDown,
+                                                 mod,
+                                                 LMGetKbdType(),
+                                                 0,
+                                                 &deadState,
+                                                 8,
+                                                 &actualLen,
+                                                 chars);
+                self.deadKeyState = deadState;
+                if (status != noErr) {
+                    actualLen = 0;
+                }
+            }
+            CFRelease(inputSource);
+        } else {
+            CGEventKeyboardGetUnicodeString(event, 8, &actualLen, chars);
+        }
+    } else {
+        CGEventKeyboardGetUnicodeString(event, 8, &actualLen, chars);
+    }
 
     if (actualLen == 0) {
-        // Dead-key de acento (~, ´, ^, `) digitada manualmente pelo usuário -> não alterar esta palavra
-        self.skipCurrentWord = YES;
+        // Dead-key em andamento (ex.: apertou ' antes de c para fazer ç, ou ~ antes de a para fazer ã): aguarda a próxima tecla!
         return event;
     }
 
@@ -1655,13 +1789,31 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     // Se houver uma substituição ainda em trânsito (< 5ms), enfileira a tecla física na sendQueue para manter a ordem exata
     BOOL shouldQueuePhysicalKey = (atomic_load(&gActiveReplacementsCount) > 0);
 
-    if (ch == '/' || ch == '@' || ch == '#' || ch == '`' || ch == ':') {
+    if (ch == '/' || ch == '@' || ch == '#' || ch == '`') {
         self.skipCurrentWord = YES;
         if (shouldQueuePhysicalKey) {
             [self sendBackspaces:0 thenString:typedStr];
             return NULL;
         }
         return event;
+    }
+
+    if (ch == ':') {
+        NSString *lowerBuf = [self.wordBuffer lowercaseString];
+        BOOL isUrlScheme = ([lowerBuf isEqualToString:@"http"] ||
+                            [lowerBuf isEqualToString:@"https"] ||
+                            [lowerBuf isEqualToString:@"mailto"] ||
+                            [lowerBuf isEqualToString:@"file"] ||
+                            [lowerBuf isEqualToString:@"ftp"]);
+        if (self.wordBuffer.length == 0 || isUrlScheme) {
+            self.skipCurrentWord = YES;
+            if (shouldQueuePhysicalKey) {
+                [self sendBackspaces:0 thenString:typedStr];
+                return NULL;
+            }
+            return event;
+        }
+        // Caso contrário (ex.: "Introducao:", "Conclusao:"), ':' é tratado como delimitador de pontuação abaixo!
     }
 
     if (ch == '.') {
@@ -1679,7 +1831,8 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     }
 
     BOOL isDelimiter = (keyCode == kKeyCodeSpace ||
-                        ch == ' ' || ch == ',' || ch == ';' || ch == '!' || ch == '?');
+                        ch == ' ' || ch == ',' || ch == ';' || ch == '!' || ch == '?' ||
+                        ch == ':' || ch == ')' || ch == ']' || ch == '"' || ch == 0x201D);
 
     if (isDelimiter) {
         if (!self.skipCurrentWord && self.wordBuffer.length >= 2) {
@@ -1769,7 +1922,11 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
         NSApplication *app = [NSApplication sharedApplication];
-        [app setActivationPolicy:NSApplicationActivationPolicyRegular];
+        BOOL bg = NO;
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--background") == 0) bg = YES;
+        }
+        [app setActivationPolicy:(bg ? NSApplicationActivationPolicyAccessory : NSApplicationActivationPolicyRegular)];
         NotionAutocorrectController *delegate = [[NotionAutocorrectController alloc] init];
         app.delegate = delegate;
         [app run];

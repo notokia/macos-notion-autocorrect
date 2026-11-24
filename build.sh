@@ -25,6 +25,7 @@ clang -isysroot "$SDK" \
       -O2 -fobjc-arc \
       -framework AppKit \
       -framework ApplicationServices \
+      -framework Carbon \
       "$DIR/main.m" \
       -o "$APP_BUNDLE/Contents/MacOS/NotionAutocorrect"
 
